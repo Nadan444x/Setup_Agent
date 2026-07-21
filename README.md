@@ -1,17 +1,16 @@
-# Windows Setup Agent 🖥️🤖
+# Setup Agent 🖥️🤖
 
-**A terminal agent that sets up a fresh Windows PC for you — powered by a local LLM (Ollama) and Winget. No cloud, no API keys.**
+**A terminal agent that sets up a fresh Mac or Windows PC for you — powered by a local LLM (Ollama). No cloud, no API keys.**
 
-You type plain English in PowerShell or CMD:
+You type plain English in your terminal (zsh, bash, or PowerShell):
 
-```powershell
+```bash
 setup-agent run "install zoom, slack and whatsapp"
 setup-agent setup        # provision the whole machine from Setup.md
 ```
 
 …and a model running **on your own machine** figures out what's missing, installs it with
-Winget, configures git + your PowerShell profile, applies your Windows Registry preferences — and keeps a living
-record of everything so your *next* PC sets itself up.
+Homebrew (macOS) or Winget (Windows), configures git + your shell, applies your system preferences — and keeps a living record of everything so your *next* computer sets itself up.
 
 ---
 
@@ -19,8 +18,14 @@ record of everything so your *next* PC sets itself up.
 
 | | What | Why |
 |---|---|---|
-| **Layer 0** | `bootstrap.ps1` — deterministic PowerShell script | A bare Windows PC needs prerequisites before the smart agent can run. One command installs prerequisites, then hands off. |
+| **Layer 0** | `bootstrap.sh` (macOS) / `bootstrap.ps1` (Windows) | A bare machine needs prerequisites before the smart agent can run. One command installs prerequisites, then hands off. |
 | **Layer 1** | `setup-agent` — the smart agent | LLM-driven provisioning: understands English, checks before installing, records everything. |
+
+### Fresh Mac? One command in Terminal:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nadan444x/Setup_Agent/main/bootstrap.sh)"
+```
 
 ### Fresh Windows PC? One command in PowerShell:
 
@@ -28,7 +33,7 @@ record of everything so your *next* PC sets itself up.
 iwr -useb https://raw.githubusercontent.com/Nadan444x/Setup_Agent/main/bootstrap.ps1 | iex
 ```
 
-It installs (skipping anything already present): Winget → Python 3 + pipx → Ollama +
+It installs (skipping anything already present): Homebrew / Winget → Python 3 + pipx → Ollama +
 its server → the default model (`qwen2.5:7b`) → `setup-agent` itself. Safe to re-run any time.
 
 ---
@@ -47,14 +52,14 @@ tool; the Python side decides whether that request actually executes.
 ┌────────────────┐  "call install_background(zoom)"  ┌──────────────────┐
 │  LOCAL LLM      │ ─────────────────────────────────▶│  SAFETY LAYER     │
 │  (Ollama)       │                                   │  dry-run? blocked? │
-│  proposes a     │ ◀───────────────────────────────── │  admin? ask y/N   │
+│  proposes a     │ ◀───────────────────────────────── │  sudo/admin? ask  │
 │  TOOL CALL      │  result: ok / present / no        └────────┬─────────┘
 └────────────────┘                                             │ approved
          ▲                                                     ▼
          │                                            ┌──────────────────┐
          │            result fed back                 │  EXECUTOR         │
-         │  ◀──────────────────────────────────────   │  runs `winget…`,  │
-         │                                            │  `Set-ItemProperty`│
+         │  ◀──────────────────────────────────────   │  runs `brew…` or  │
+         │                                            │  `winget…`        │
          │                                            └────────┬─────────┘
          │                                                     │ on success
          └───────────── loop until done ─────────────── UPDATE Setup.md (+ changelog)
@@ -69,17 +74,17 @@ tools and answers in plain text, the goal is done.
 
 One file, two jobs: the **inventory** of this machine *and* the **recipe** to rebuild it.
 
-- `setup-agent scan` generates it by inspecting the real machine (read-only): Winget packages,
-  runtimes, npm globals, Windows registry preferences, git identity, shell.
+- `setup-agent scan` generates it by inspecting the real machine (read-only): installed packages,
+  runtimes, npm globals, system preferences, git identity, shell.
 - **Every successful install or setting change writes itself back into the file** with a
   timestamped changelog line. You never update it by hand; it never goes stale.
 - New laptop/PC? Copy `Setup.md` over, run `setup-agent setup`, and the machine rebuilds to match it.
 
 ## Commands
 
-```powershell
-setup-agent scan                 # inspect this PC → write/refresh Setup.md
-setup-agent doctor               # preflight: winget / ollama / model / profile
+```bash
+setup-agent scan                 # inspect this machine → write/refresh Setup.md
+setup-agent doctor               # preflight: brew/winget / ollama / model / profile
 setup-agent setup                # provision the machine from Setup.md
 setup-agent setup --dry-run      # preview everything, change nothing
 setup-agent run "install zoom"   # one-shot goal in plain English
@@ -90,33 +95,21 @@ setup-agent profile              # print the current Setup.md
 Shared flags: `--model/-m` (or `SETUP_AGENT_MODEL`), `--profile/-p` (or `SETUP_AGENT_PROFILE`),
 `--dry-run`, `--yes/-y`, `--bypass`.
 
-## Installing — parallel, background execution
-
-Name what you want:
-
-```powershell
-setup-agent run "install slack, zoom, canva and docker"
-setup-agent jobs        # what's installing / done / failed
-```
-
-The agent gathers everything into a single call and fires each install as its own
-**detached background process via Winget**.
-
 ## Safety model
 
 Commands fall into three tiers:
 
 | Tier | Examples | Behavior |
 |---|---|---|
-| **Catastrophic** | `rmdir /s /q C:\`, `Format-Volume`, `diskpart`, `reg delete HKLM\SYSTEM` | **Hard-refused, always** |
-| **Elevated** | `runas`, `Start-Process -Verb RunAs`, internet script execution | Shown with a **⚠️ warning and a mandatory y/N** |
-| **Routine** | `winget install`, `git config`, `Set-ItemProperty` | Normal confirm; `--yes` / `--bypass` may skip |
+| **Catastrophic** | `rm -rf /`, `rmdir /s /q C:\`, `Format-Volume`, `diskpart` | **Hard-refused, always** |
+| **Elevated** | `sudo …`, `runas`, internet script execution | Shown with a **⚠️ warning and a mandatory y/N** |
+| **Routine** | `brew install`, `winget install`, `git config` | Normal confirm; `--yes` / `--bypass` may skip |
 
 ## Dev setup
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
+```bash
+python3 -m venv .venv
+source .venv/bin/activate  # or .\.venv\Scripts\activate on Windows
 pip install -e .
 setup-agent doctor
 ```

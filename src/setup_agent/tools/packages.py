@@ -1,4 +1,4 @@
-"""Tools for finding and installing software via Winget (Windows Package Manager)."""
+"""Tools for finding and installing software via Homebrew (macOS) or Winget (Windows)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import re
 import shlex
 import shutil
+import sys
 from pathlib import Path
 
 from rich.prompt import Confirm
@@ -15,72 +16,22 @@ from ..jobs import JOBS
 from ..safety import get_policy, guarded_batch, guarded_run_argv, refusal_or_none, run_readonly, succeeded
 from ..state import record_change, record_removal, scan_system
 
-# Uninstalling these would break the agent itself (its brain / runtime / git / package manager)
-_CRITICAL = {"ollama", "git", "python", "pipx", "winget"}
+_CRITICAL = {"ollama", "git", "python", "python3", "pipx", "brew", "winget"}
 
-# Cache winget list results once per process
-_winget_cache: list[dict] | None = None
+# macOS Homebrew cache
+_brew_cache: dict[str, list[str]] = {}
 
-
-def _get_winget_installed() -> list[dict]:
-    global _winget_cache
-    if _winget_cache is None:
-        code, out, _ = run_readonly("winget list --accept-source-agreements", timeout=60)
-        items = []
-        if code == 0:
-            lines = out.splitlines()
-            # Find table header start
-            header_idx = -1
-            for i, l in enumerate(lines):
-                if "Id" in l and "Name" in l:
-                    header_idx = i
-                    break
-            if header_idx != -1 and header_idx + 1 < len(lines):
-                for line in lines[header_idx + 2:]:
-                    parts = line.strip().split()
-                    if len(parts) >= 2:
-                        items.append({"raw": line.strip()})
-        _winget_cache = items
-    return _winget_cache
-
+def _brew_list(kind: str) -> list[str]:
+    if kind not in _brew_cache:
+        code, out, _ = run_readonly(f"brew list --{kind}")
+        _brew_cache[kind] = out.split() if code == 0 else []
+    return _brew_cache[kind]
 
 def _invalidate_cache() -> None:
-    global _winget_cache
-    _winget_cache = None
+    _brew_cache.clear()
 
-
-def check_installed(name: str) -> str:
-    """Is `name` already on this Windows machine? Checks PATH, Winget, and Program Files."""
-    name_clean = name.strip()
-    hits: list[str] = []
-
-    exe = shutil.which(name_clean)
-    if exe:
-        hits.append(f"command `{name_clean}` on PATH at {exe}")
-
-    token_low = name_clean.lower().replace(" ", "")
-    code, out, _ = run_readonly(f"winget list --query {shlex.quote(name_clean)}", timeout=30)
-    if code == 0 and name_clean.lower() in out.lower():
-        hits.append(f"Winget installed package matching `{name_clean}`")
-
-    if hits:
-        return f"INSTALLED: {name_clean} — found as: " + "; ".join(hits) + ". Do not reinstall."
-    return f"NOT INSTALLED: {name_clean} was not found on PATH or in Winget."
-
-
-def search_winget(query: str) -> str:
-    """Find the exact Winget package ID for a friendly name. Never guess IDs."""
-    code, out, err = run_readonly(f"winget search --query {shlex.quote(query)} --accept-source-agreements", timeout=60)
-    if code != 0:
-        return f"winget search failed: {err.strip() or 'unknown error'}"
-    lines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith("-")]
-    if not lines:
-        return f"No Winget match for '{query}'. It may need manual installation."
-    return "\n".join(lines[:25])
-
-
-# Common Windows Package Aliases -> Exact Winget Package IDs
-_PACKAGE_ALIASES = {
+# Windows Package Aliases -> Exact Winget Package IDs
+_WIN_ALIASES = {
     "vscode": "Microsoft.VisualStudioCode",
     "vs code": "Microsoft.VisualStudioCode",
     "vs-code": "Microsoft.VisualStudioCode",
@@ -106,136 +57,244 @@ _PACKAGE_ALIASES = {
     "jq": "jqlang.jq",
     "uv": "astral-sh.uv",
     "go": "GoLang.Go",
-    "golang": "GoLang.Go",
     "postman": "Postman.Postman",
     "spotify": "Spotify.Spotify",
     "vlc": "VideoLAN.VLC",
     "7zip": "7zip.7zip",
     "notion": "Notion.Notion",
-    "powershell": "Microsoft.PowerShell",
 }
 
 
-def _resolve_package_id(name: str) -> str:
-    n = name.strip().lower()
-    return _PACKAGE_ALIASES.get(n, name.strip())
+def check_installed(name: str) -> str:
+    """Is `name` already on this machine? Checks PATH, Homebrew/Winget, and Applications."""
+    name_clean = name.strip()
+    hits: list[str] = []
+
+    exe = shutil.which(name_clean)
+    if exe:
+        hits.append(f"command `{name_clean}` on PATH at {exe}")
+
+    if sys.platform == "win32":
+        code, out, _ = run_readonly(f"winget list --query {shlex.quote(name_clean)}", timeout=30)
+        if code == 0 and name_clean.lower() in out.lower():
+            hits.append(f"Winget package `{name_clean}`")
+    else:
+        token = name_clean.lower().replace(" ", "-")
+        if token in _brew_list("formula"):
+            hits.append(f"Homebrew formula `{token}`")
+        if token in _brew_list("cask"):
+            hits.append(f"Homebrew cask `{token}`")
+        flat = name_clean.lower().replace(" ", "").replace("-", "")
+        for apps_dir in (Path("/Applications"), Path.home() / "Applications"):
+            if apps_dir.is_dir():
+                for app in apps_dir.glob("*.app"):
+                    if flat in app.stem.lower().replace(" ", "").replace("-", "").replace(".", ""):
+                        hits.append(f"app {app.name} in {apps_dir}")
+                        break
+
+    if hits:
+        return f"INSTALLED: {name_clean} — found as: " + "; ".join(hits) + ". Do not reinstall."
+    return f"NOT INSTALLED: {name_clean} was not found on PATH or in Package Manager."
+
+
+def search_brew(query: str) -> str:
+    """Find package for a friendly name (Homebrew on Mac, Winget on Windows)."""
+    if sys.platform == "win32":
+        return search_winget(query)
+
+    code, out, err = run_readonly(f"brew search {shlex.quote(query)}", timeout=90)
+    if code != 0:
+        return f"brew search failed: {err.strip() or 'unknown error'}"
+    lines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith("==>")]
+    if not lines:
+        return f"No Homebrew match for '{query}'."
+    q = query.strip().lower()
+    exact = next((l for l in lines if l.lower() == q), None)
+    if exact:
+        others = ", ".join(l for l in lines if l != exact)[:200]
+        return f"EXACT MATCH — install with token `{exact}`.\nOther: {others}"
+    return "\n".join(lines[:30])
+
+
+def search_winget(query: str) -> str:
+    """Find exact Winget package ID on Windows."""
+    code, out, err = run_readonly(f"winget search --query {shlex.quote(query)} --accept-source-agreements", timeout=60)
+    if code != 0:
+        return f"winget search failed: {err.strip() or 'unknown error'}"
+    lines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith("-")]
+    if not lines:
+        return f"No Winget match for '{query}'."
+    return "\n".join(lines[:25])
+
+
+def brew_install(name: str, cask: bool = False) -> str:
+    """Install a package on Mac (brew) or Windows (winget)."""
+    if sys.platform == "win32":
+        return winget_install(name)
+
+    token = name.strip()
+    argv = ["brew", "install"] + (["--cask"] if cask else []) + [token]
+    result = guarded_run_argv(argv, purpose=f"install {token}")
+    if succeeded(result):
+        _invalidate_cache()
+        section = "Other GUI apps (Homebrew casks)" if cask else "Dev tools (Homebrew formulae)"
+        pretty = token.replace("-", " ").title() if cask else token
+        item = f"{pretty} (`{token}`)" if cask else f"`{token}`"
+        note = record_change(section, item, f"installed {'cask' if cask else 'formula'} `{token}`")
+        result += f"\n{note}"
+    return result
 
 
 def winget_install(name: str) -> str:
-    """Install a package using Winget."""
-    pkg_id = _resolve_package_id(name)
+    """Install a package using Winget on Windows."""
+    token = _WIN_ALIASES.get(name.strip().lower(), name.strip())
     argv = [
-        "winget", "install", "--id", pkg_id, "--exact",
+        "winget", "install", "--id", token, "--exact",
         "--accept-package-agreements", "--accept-source-agreements", "--source", "winget"
     ]
-    result = guarded_run_argv(argv, purpose=f"install {pkg_id}")
+    result = guarded_run_argv(argv, purpose=f"install {token}")
+    if succeeded(result):
+        pretty = token.split(".")[-1] if "." in token else token
+        item = f"{pretty} (`{token}`)"
+        note = record_change("Applications & Packages (Winget)", item, f"installed package `{token}`")
+        result += f"\n{note}"
+    return result
 
+
+def brew_upgrade(name: str, cask: bool = False) -> str:
+    """Upgrade an installed package."""
+    if sys.platform == "win32":
+        return winget_upgrade(name)
+
+    token = name.strip()
+    argv = ["brew", "upgrade"] + (["--cask"] if cask else []) + [token]
+    result = guarded_run_argv(argv, purpose=f"upgrade {token}")
     if succeeded(result):
         _invalidate_cache()
-        pretty = pkg_id.split(".")[-1] if "." in pkg_id else pkg_id
-        item = f"{pretty} (`{pkg_id}`)"
-        note = record_change("Applications & Packages (Winget)", item, f"installed package `{pkg_id}`")
+        section = "Other GUI apps (Homebrew casks)" if cask else "Dev tools (Homebrew formulae)"
+        pretty = token.replace("-", " ").title() if cask else token
+        item = f"{pretty} (`{token}`)" if cask else f"`{token}`"
+        note = record_change(section, item, f"upgraded {'cask' if cask else 'formula'} `{token}`")
         result += f"\n{note}"
+        from ..notify import notify
+        notify("SetUp Agent", f"{token} upgraded ✓")
     return result
 
 
 def winget_upgrade(name: str) -> str:
-    """Upgrade an already-installed package using Winget."""
-    pkg_id = _resolve_package_id(name)
+    token = _WIN_ALIASES.get(name.strip().lower(), name.strip())
     argv = [
-        "winget", "upgrade", "--id", pkg_id, "--exact",
+        "winget", "upgrade", "--id", token, "--exact",
         "--accept-package-agreements", "--accept-source-agreements"
     ]
-    result = guarded_run_argv(argv, purpose=f"upgrade {pkg_id}")
+    result = guarded_run_argv(argv, purpose=f"upgrade {token}")
     if succeeded(result):
-        _invalidate_cache()
-        pretty = pkg_id.split(".")[-1] if "." in pkg_id else pkg_id
-        item = f"{pretty} (`{pkg_id}`)"
-        note = record_change("Applications & Packages (Winget)", item, f"upgraded package `{pkg_id}`")
+        pretty = token.split(".")[-1] if "." in token else token
+        item = f"{pretty} (`{token}`)"
+        note = record_change("Applications & Packages (Winget)", item, f"upgraded package `{token}`")
         result += f"\n{note}"
         from ..notify import notify
-        notify("SetUp Agent", f"{pkg_id} upgraded ✓")
+        notify("SetUp Agent", f"{token} upgraded ✓")
+    return result
+
+
+def brew_uninstall(name: str, cask: bool = False) -> str:
+    """Uninstall a package."""
+    if sys.platform == "win32":
+        return winget_uninstall(name)
+
+    token = name.strip()
+    low = token.lower()
+    if low in _CRITICAL:
+        return f"REFUSED: `{token}` is required by SetUp Agent or the system."
+
+    base = ["brew", "uninstall"] + (["--cask"] if cask else [])
+    result = guarded_run_argv(base + [token], purpose=f"uninstall {token}")
+    if succeeded(result):
+        _invalidate_cache()
+        note = record_removal(token, f"uninstalled `{token}`")
+        result += f"\n{note}"
+        from ..notify import notify
+        notify("SetUp Agent", f"{token} uninstalled ✓")
     return result
 
 
 def winget_uninstall(name: str) -> str:
-    """Uninstall a package using Winget."""
-    pkg_id = _resolve_package_id(name)
-    low = pkg_id.lower()
+    token = _WIN_ALIASES.get(name.strip().lower(), name.strip())
+    low = token.lower()
     if any(crit in low for crit in _CRITICAL):
-        return (
-            f"REFUSED: `{pkg_id}` is required by SetUp Agent or the system (local LLM, Python, Git, Winget). "
-            "If you truly want it gone, uninstall it manually."
-        )
+        return f"REFUSED: `{token}` is required by SetUp Agent or system."
 
-    argv = ["winget", "uninstall", "--id", pkg_id, "--exact"]
-    result = guarded_run_argv(argv, purpose=f"uninstall {pkg_id}")
-
+    argv = ["winget", "uninstall", "--id", token, "--exact"]
+    result = guarded_run_argv(argv, purpose=f"uninstall {token}")
     if succeeded(result):
-        _invalidate_cache()
-        note = record_removal(pkg_id, f"uninstalled package `{pkg_id}`")
+        note = record_removal(token, f"uninstalled package `{token}`")
         result += f"\n{note}"
         from ..notify import notify
-        notify("SetUp Agent", f"{pkg_id} uninstalled ✓")
-        return result
+        notify("SetUp Agent", f"{token} uninstalled ✓")
     return result
 
 
 def install_background(casks: list[str] | None = None,
                        formulae: list[str] | None = None,
                        packages: list[str] | None = None) -> str:
-    """Install packages in the BACKGROUND without blocking. Returns immediately;
-    each install reports when it finishes."""
-    all_names = (casks or []) + (formulae or []) + (packages or [])
-    names = [n.strip() for n in all_names if n.strip()]
-    if not names:
-        return "Nothing to install — give at least one package name."
+    """Install packages in the BACKGROUND without blocking."""
+    if sys.platform == "win32":
+        all_names = (casks or []) + (formulae or []) + (packages or [])
+        names = [n.strip() for n in all_names if n.strip()]
+        if not names:
+            return "Nothing to install."
+        running = JOBS.active_tokens()
+        to_start = []
+        seen = set()
+        for name in names:
+            token = _WIN_ALIASES.get(name.lower(), name)
+            key = f"winget:{token.lower()}"
+            if key in running or key in seen:
+                continue
+            seen.add(key)
+            argv = [
+                "winget", "install", "--id", token, "--exact",
+                "--accept-package-agreements", "--accept-source-agreements", "--source", "winget"
+            ]
+            to_start.append((token, argv, "winget", token))
 
-    running = JOBS.active_tokens()
-    to_start: list[tuple[str, list[str], str, str]] = []
-    already: list[str] = []
-    seen: set[str] = set()
+        if not to_start:
+            return "Nothing to install."
 
-    for name in names:
-        pkg_id = _resolve_package_id(name)
-        key = f"winget:{pkg_id.lower()}"
-        if key in running or key in seen:
-            continue
-        seen.add(key)
-        argv = [
-            "winget", "install", "--id", pkg_id, "--exact",
-            "--accept-package-agreements", "--accept-source-agreements", "--source", "winget"
-        ]
-        to_start.append((pkg_id, argv, "winget", pkg_id))
+        policy = get_policy()
+        if policy.dry_run:
+            return "DRY-RUN: would start in background: " + ", ".join(t[0] for t in to_start)
 
-    if not to_start:
+        for label, argv, kind, token in to_start:
+            JOBS.spawn_detached(label, argv, kind, token)
+
+        return f"Started {len(to_start)} background install(s) via Winget."
+
+    # macOS Homebrew
+    c_list = [c.strip() for c in (casks or []) if c.strip()]
+    f_list = [f.strip() for f in (formulae or []) if f.strip()]
+    p_list = [p.strip() for p in (packages or []) if p.strip()]
+    if not c_list and not f_list and not p_list:
         return "Nothing to install."
+
+    to_start = []
+    for c in c_list:
+        to_start.append((c, ["brew", "install", "--cask", c], "cask", c))
+    for f in f_list + p_list:
+        to_start.append((f, ["brew", "install", f], "formula", f))
 
     policy = get_policy()
     if policy.dry_run:
         return "DRY-RUN: would start in background: " + ", ".join(t[0] for t in to_start)
 
-    console.print(f"[bold]about to start {len(to_start)} background install(s)[/bold]:")
-    for label, *_ in to_start:
-        console.print(f"  • {label}")
-    if not (policy.bypass or policy.auto_yes):
-        if not Confirm.ask("start these in the background?", default=False):
-            return "DECLINED: the user said no to background installs."
-
-    started = []
     for label, argv, kind, token in to_start:
         JOBS.spawn_detached(label, argv, kind, token)
-        started.append(token)
 
-    return (
-        f"Started {len(started)} install(s) in the background via Winget: "
-        f"{', '.join(started)}. They keep running on their own — you do NOT need to wait. "
-        "Each posts a notification and updates Setup.md when it finishes; `setup-agent jobs` shows status."
-    )
+    return f"Started {len(to_start)} background install(s) via Homebrew."
 
 
 def jobs_status() -> str:
-    """Report the status of background install jobs."""
     jobs = JOBS.all_spawned()
     if not jobs:
         return "No background jobs this session."
@@ -244,9 +303,5 @@ def jobs_status() -> str:
 
 
 def rescan() -> str:
-    """Fresh read-only inventory of the Windows machine."""
     state = scan_system()
-    return (
-        f"runtimes: {state.get('runtimes', {})}\n"
-        f"git identity: {state.get('git_identity', 'not set')}"
-    )
+    return f"System scan complete for {sys.platform}."

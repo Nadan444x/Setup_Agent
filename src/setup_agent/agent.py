@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 
 import ollama
@@ -110,9 +111,9 @@ def _extract_text_toolcalls(content: str) -> list[tuple[str, dict]]:
 
 
 SYSTEM_PROMPT = """\
-You are SetUp Agent, a careful assistant that provisions a Windows PC from the terminal.
+You are SetUp Agent, a careful assistant that provisions a machine (macOS or Windows) from the terminal.
 
-Environment: Windows 10/11 with Winget (Windows Package Manager) and PowerShell. You act ONLY through the provided tools. Some requests come
+Environment: {os_name} with {package_manager}. You act ONLY through the provided tools. Some requests come
 back REFUSED (safety) or DECLINED — accept that and adapt; never retry a refused command.
 
 ACT, DON'T ASK. When the user asks you to install / uninstall / update / set up something, DO
@@ -121,9 +122,9 @@ it?", "Shall I proceed?", or "Do you want to continue?". The user's request IS y
 
 Rules:
 1. Before installing anything, call check_installed. Never reinstall what exists.
-2. Use each package's Winget ID or name (Zoom → 'Zoom.Zoom', Slack → 'SlackTechnologies.Slack', VS Code → 'Microsoft.VisualStudioCode', Chrome → 'Google.Chrome', Git → 'Git.Git'). Call search_winget if you're unsure of an ID.
-3. install_background is THE main install tool. Gather EVERY app/tool the user asked for and make ONE install_background call (packages=['...']). They install in parallel in the background. Already-installed items are skipped automatically.
-4. For "update X" / "upgrade X" requests, use winget_upgrade. For "set up GitHub" / "log in to github" / "set up ssh", CALL the setup_github tool.
+2. Use each app's package token / ID. Call search_brew or search_winget if you're unsure.
+3. install_background is THE main install tool. Gather EVERY app/tool requested and call it ONCE. All install in parallel in the background. Already-installed items are skipped automatically.
+4. For "update X" / "upgrade X" requests, use brew_upgrade or winget_upgrade. For "set up GitHub" / "log in to github" / "set up ssh", CALL the setup_github tool.
 5. Use run_shell only when no dedicated tool fits.
 6. Successful changes are recorded into the Setup.md profile automatically — you do not need to update it yourself.
 7. When the goal is done, reply in plain text with a short summary: installed / already present / skipped / failed.
@@ -137,7 +138,9 @@ if you need the full item list. If empty, suggest `setup-agent scan`.
 
 def _system_message() -> dict:
     profile = profile_summary() or "(no Setup.md yet — run `setup-agent scan`)"
-    return {"role": "system", "content": SYSTEM_PROMPT.format(profile=profile)}
+    os_name = "Windows" if sys.platform == "win32" else "macOS"
+    pkg_mgr = "Winget and PowerShell" if sys.platform == "win32" else "Homebrew"
+    return {"role": "system", "content": SYSTEM_PROMPT.format(os_name=os_name, package_manager=pkg_mgr, profile=profile)}
 
 
 def _preflight(model: str) -> bool:
@@ -246,10 +249,10 @@ def _note_background_jobs() -> None:
 def run_goal(goal: str, model: str = DEFAULT_MODEL) -> None:
     if not _preflight(model):
         return
-    rule("SetUp Agent (Windows)")
+    rule("SetUp Agent")
     logfile = debuglog.start_session(f"run: {goal}")
     info(f"model: {model} · profile: {profile_path()}")
-    info(f"live log: Get-Content -Wait {logfile}")
+    info(f"live log: tail -f {logfile}")
     messages = [_system_message(), {"role": "user", "content": goal}]
     try:
         _loop(model, messages)
@@ -261,10 +264,10 @@ def run_goal(goal: str, model: str = DEFAULT_MODEL) -> None:
 def chat_repl(model: str = DEFAULT_MODEL) -> None:
     if not _preflight(model):
         return
-    rule("SetUp Agent (Windows) — chat (type 'exit' to quit)")
+    rule("SetUp Agent — chat (type 'exit' to quit)")
     logfile = debuglog.start_session("chat session")
     info(f"model: {model} · profile: {profile_path()}")
-    info(f"live log: Get-Content -Wait {logfile}")
+    info(f"live log: tail -f {logfile}")
     messages = [_system_message()]
     while True:
         _report_completed_jobs()

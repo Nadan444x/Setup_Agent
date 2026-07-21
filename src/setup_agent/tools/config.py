@@ -1,4 +1,4 @@
-"""Tools for git identity, PowerShell configuration, and GitHub (gh + SSH) setup on Windows."""
+"""Tools for git identity, shell configuration (.zshrc on Mac, $PROFILE on Windows), and GitHub (gh + SSH) setup."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import socket
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -84,10 +85,10 @@ def _any_pubkey() -> Path | None:
 
 
 def setup_github(email: str = "") -> str:
-    """Set up GitHub on this Windows machine: check SSH, gh auth, and register key."""
+    """Set up GitHub on this machine: create SSH key, log in to gh CLI, and register key."""
     if not shutil.which("gh"):
-        return ("NOT READY: the GitHub CLI `gh` isn't installed. Install it first with "
-                "install_background(packages=['Git.GitHubCLI']), then call setup_github again.")
+        return ("NOT READY: the GitHub CLI `gh` isn't installed. Install it first, "
+                "then call setup_github again.")
 
     steps: list[str] = []
     changed = False
@@ -107,7 +108,7 @@ def setup_github(email: str = "") -> str:
         else:
             steps.append(f"SSH key: could not generate ({r.splitlines()[0]})")
     else:
-        steps.append(f"SSH key: found {pub.name} (not yet confirmed with GitHub — will try to register)")
+        steps.append(f"SSH key: found {pub.name} (will try to register)")
 
     if _gh_authed():
         u = _github_username()
@@ -138,21 +139,25 @@ def setup_github(email: str = "") -> str:
     return "GitHub setup:\n- " + "\n- ".join(steps)
 
 
-def get_powershell_profile_path() -> Path:
-    """Find or return the default Windows PowerShell / PowerShell profile path."""
+def append_powershell_config(snippet: str) -> str:
+    """Append a line to PowerShell $PROFILE (Windows)."""
     docs = Path.home() / "Documents"
     ps7_prof = docs / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
     ps5_prof = docs / "WindowsPowerShell" / "Microsoft.PowerShell_profile.ps1"
-    if ps7_prof.exists():
-        return ps7_prof
-    if ps5_prof.exists():
-        return ps5_prof
-    return ps7_prof
+    profile_file = ps7_prof if ps7_prof.exists() else (ps5_prof if ps5_prof.exists() else ps7_prof)
+    return _append_to_file(profile_file, snippet, "PowerShell $PROFILE")
 
 
-def append_powershell_config(snippet: str) -> str:
-    """Append a line (alias, function, environment variable) to PowerShell $PROFILE."""
-    profile_file = get_powershell_profile_path()
+def append_shell_config(snippet: str) -> str:
+    """Append a line to shell config (.zshrc on Mac, $PROFILE on Windows)."""
+    if sys.platform == "win32":
+        return append_powershell_config(snippet)
+    
+    zshrc = Path.home() / ".zshrc"
+    return _append_to_file(zshrc, snippet, "~/.zshrc")
+
+
+def _append_to_file(file_path: Path, snippet: str, label: str) -> str:
     snippet = snippet.strip()
     policy = get_policy()
 
@@ -160,25 +165,25 @@ def append_powershell_config(snippet: str) -> str:
     if refusal:
         return refusal
 
-    if profile_file.exists() and snippet in profile_file.read_text(encoding="utf-8"):
-        return f"SKIPPED: PowerShell $PROFILE already contains: {snippet}"
+    if file_path.exists() and snippet in file_path.read_text(encoding="utf-8"):
+        return f"SKIPPED: {label} already contains: {snippet}"
 
     if policy.dry_run:
-        return f"DRY-RUN: would append to PowerShell $PROFILE ({profile_file}): `{snippet}`. Assume success."
+        return f"DRY-RUN: would append to {label} ({file_path}): `{snippet}`. Assume success."
 
-    console.print(f"[bold]about to append to PowerShell $PROFILE ({profile_file})[/bold]:")
+    console.print(f"[bold]about to append to {label} ({file_path})[/bold]:")
     command_preview(snippet)
     if not Confirm.ask("append this line?", default=False):
         return "DECLINED: the user said no to this shell config change."
 
-    profile_file.parent.mkdir(parents=True, exist_ok=True)
-    if profile_file.exists():
-        backup = profile_file.with_suffix(f".setup-agent-{datetime.now():%Y%m%d}.bak")
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    if file_path.exists():
+        backup = file_path.with_suffix(f".setup-agent-{datetime.now():%Y%m%d}.bak")
         if not backup.exists():
-            backup.write_text(profile_file.read_text(encoding="utf-8"), encoding="utf-8")
-    
-    with profile_file.open("a", encoding="utf-8") as fh:
+            backup.write_text(file_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    with file_path.open("a", encoding="utf-8") as fh:
         fh.write(f"\n{snippet}  {MARKER}\n")
 
-    note = record_change("Shell", f"`{snippet}`", f"appended to PowerShell $PROFILE: {snippet}")
-    return f"exit=0\nappended to PowerShell $PROFILE (backup kept). {note}"
+    note = record_change("Shell", f"`{snippet}`", f"appended to {label}: {snippet}")
+    return f"exit=0\nappended to {label} (backup kept). {note}"

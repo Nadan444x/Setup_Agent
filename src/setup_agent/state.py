@@ -1,10 +1,9 @@
-"""The living system file: scan Windows, generate Setup.md, keep it updated.
-
-Setup.md is both the INVENTORY of this machine and the RECIPE to rebuild it on the next one.
+"""The living system file: scan machine (macOS or Windows), generate Setup.md, keep it updated.
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import shutil
@@ -49,7 +48,6 @@ def _state_locked():
                     pass
                 fh.close()
         else:
-            import fcntl
             try:
                 fcntl.flock(fh, fcntl.LOCK_EX)
                 yield
@@ -89,6 +87,29 @@ def profile_path() -> Path:
 
 # ----------------------------------------------------------------- scan ----
 
+_COMMUNICATION = {"slack", "zoom", "whatsapp", "telegram", "discord", "microsoft-teams", "signal"}
+_BROWSERS = {"google-chrome", "brave-browser", "firefox", "microsoft-edge", "arc", "safari-technology-preview"}
+
+_MACOS_PREF_KEYS = [
+    ("NSGlobalDomain", "AppleInterfaceStyle", "string"),
+    ("NSGlobalDomain", "AppleAccentColor", "int"),
+    ("NSGlobalDomain", "AppleHighlightColor", "string"),
+    ("NSGlobalDomain", "AppleInterfaceStyleSwitchesAutomatically", "bool"),
+    ("NSGlobalDomain", "NSTableViewDefaultSizeMode", "int"),
+    ("com.apple.dock", "autohide", "bool"),
+    ("com.apple.dock", "tilesize", "int"),
+    ("com.apple.dock", "magnification", "bool"),
+    ("com.apple.dock", "largesize", "int"),
+    ("com.apple.dock", "orientation", "string"),
+    ("NSGlobalDomain", "KeyRepeat", "int"),
+    ("NSGlobalDomain", "InitialKeyRepeat", "int"),
+    ("NSGlobalDomain", "AppleShowAllExtensions", "bool"),
+    ("com.apple.finder", "AppleShowAllFiles", "bool"),
+    ("com.apple.finder", "ShowPathbar", "bool"),
+    ("com.apple.finder", "ShowStatusBar", "bool"),
+    ("com.apple.screencapture", "location", "string"),
+]
+
 _WIN_PREF_KEYS = [
     ("HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "AppsUseLightTheme", "dword"),
     ("HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "SystemUsesLightTheme", "dword"),
@@ -100,7 +121,7 @@ _RUNTIME_PROBES = [
     ("Node.js", "node", "node -v"),
     ("npm", "npm", "npm -v"),
     ("pnpm", "pnpm", "pnpm -v"),
-    ("Python", "python", "python --version"),
+    ("Python", "python3" if sys.platform != "win32" else "python", "python --version" if sys.platform == "win32" else "python3 --version"),
     ("uv", "uv", "uv --version"),
     ("Go", "go", "go version"),
     ("Java", "java", "java -version"),
@@ -136,7 +157,6 @@ def _lines(command: str) -> list[str]:
 
 
 def _parse_winget_list(out: str) -> list[tuple[str, str]]:
-    """Parse winget list output table into list of (clean_name, package_id)."""
     lines = out.splitlines()
     header_idx = -1
     id_pos = -1
@@ -178,14 +198,41 @@ def _parse_winget_list(out: str) -> list[tuple[str, str]]:
 
 
 def scan_system() -> dict:
-    """Inventory the Windows machine. Read-only: safe to run any time."""
+    """Inventory the machine (macOS or Windows). Read-only."""
     state: dict = {}
+    state["os"] = "windows" if sys.platform == "win32" else "macos"
 
-    code, out, _ = run_readonly("winget list --accept-source-agreements", timeout=45)
-    winget_pkgs = []
-    if code == 0:
-        winget_pkgs = _parse_winget_list(out)
-    state["winget_packages"] = winget_pkgs[:100]
+    if sys.platform == "win32":
+        code, out, _ = run_readonly("winget list --accept-source-agreements", timeout=45)
+        winget_pkgs = _parse_winget_list(out) if code == 0 else []
+        state["winget_packages"] = winget_pkgs[:100]
+        prefs: list[tuple[str, str, str, str]] = []
+        for key_path, val_name, v_type in _WIN_PREF_KEYS:
+            ps_cmd = f"(Get-ItemProperty -Path '{key_path}' -Name '{val_name}' -ErrorAction SilentlyContinue).{val_name}"
+            code, out, _ = run_readonly(f"powershell -NoProfile -Command \"{ps_cmd}\"", timeout=10)
+            if code == 0 and out.strip():
+                prefs.append((key_path, val_name, v_type, out.strip()))
+        state["windows_prefs"] = prefs
+        ps_profile = Path.home() / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
+        state["shell"] = {"shell": "PowerShell", "profile_exists": ps_profile.exists()}
+    else:
+        state["formulae"] = _lines("brew leaves")
+        state["casks"] = _lines("brew list --cask")
+        apps: set[str] = set()
+        for apps_dir in (Path("/Applications"), Path.home() / "Applications"):
+            if apps_dir.is_dir():
+                apps.update(p.stem for p in apps_dir.glob("*.app"))
+        state["apps"] = sorted(apps)
+        mac_prefs: list[tuple[str, str, str, str]] = []
+        for domain, key, type_hint in _MACOS_PREF_KEYS:
+            code, out, _ = run_readonly(f"defaults read {domain} {key} 2>/dev/null", timeout=15)
+            if code == 0 and out.strip():
+                mac_prefs.append((domain, key, type_hint, out.strip()))
+        state["macos_prefs"] = mac_prefs
+        state["shell"] = {
+            "shell": os.environ.get("SHELL", "/bin/zsh"),
+            "oh_my_zsh": (Path.home() / ".oh-my-zsh").is_dir(),
+        }
 
     runtimes: dict[str, str] = {}
     for label, binary, probe in _RUNTIME_PROBES:
@@ -197,16 +244,8 @@ def scan_system() -> dict:
 
     state["npm_globals"] = [
         line.split("/node_modules/", 1)[-1].split("\\node_modules\\", 1)[-1]
-        for line in _lines("npm ls -g --depth=0 --parseable")[1:]
+        for line in _lines("npm ls -g --depth=0 --parseable 2>/dev/null")[1:]
     ]
-
-    prefs: list[tuple[str, str, str, str]] = []
-    for key_path, val_name, v_type in _WIN_PREF_KEYS:
-        ps_cmd = f"(Get-ItemProperty -Path '{key_path}' -Name '{val_name}' -ErrorAction SilentlyContinue).{val_name}"
-        code, out, _ = run_readonly(f"powershell -NoProfile -Command \"{ps_cmd}\"", timeout=10)
-        if code == 0 and out.strip():
-            prefs.append((key_path, val_name, v_type, out.strip()))
-    state["windows_prefs"] = prefs
 
     identity = {}
     for field in ("name", "email"):
@@ -214,12 +253,6 @@ def scan_system() -> dict:
         if out.strip():
             identity[field] = out.strip()
     state["git_identity"] = identity
-
-    ps_profile = Path.home() / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
-    state["shell"] = {
-        "shell": "PowerShell",
-        "profile_exists": ps_profile.exists(),
-    }
 
     gh = shutil.which("gh")
     state["github"] = {
@@ -236,13 +269,19 @@ def _stamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def _cask_line(token: str) -> str:
+    pretty = token.replace("-", " ").title()
+    return f"- {pretty} (`{token}`)   ✅ installed"
+
+
 def render_profile(state: dict) -> str:
-    """Turn a Windows scan into the living Setup.md markdown."""
+    """Turn a scan into the living Setup.md markdown."""
+    os_label = "Windows" if state.get("os") == "windows" else "macOS"
     out: list[str] = [
-        f"# Setup — Windows Machine Profile   (generated by SetUp Agent · last updated {_stamp()})",
+        f"# Setup — {os_label} Machine Profile   (generated by SetUp Agent · last updated {_stamp()})",
         "",
-        "> Living file: SetUp Agent generated this by scanning the Windows PC and updates it",
-        "> automatically after every install or setting change. On a new PC, run",
+        f"> Living file: SetUp Agent generated this by scanning the {os_label} machine and updates it",
+        "> automatically after every install or setting change. On a new machine, run",
         "> `setup-agent setup` against this file to rebuild everything.",
         "",
     ]
@@ -252,38 +291,41 @@ def render_profile(state: dict) -> str:
         out.extend(lines if lines else ["- (none captured)"])
         out.append("")
 
-    pkgs_rendered = []
-    for pkg in state.get("winget_packages", []):
-        if isinstance(pkg, (tuple, list)) and len(pkg) == 2:
-            name, pkg_id = pkg
-            pkgs_rendered.append(f"- {name} (`{pkg_id}`)   ✅ installed")
-        else:
-            pkgs_rendered.append(f"- `{pkg}`   ✅ installed")
+    if state.get("os") == "windows":
+        pkgs_rendered = []
+        for pkg in state.get("winget_packages", []):
+            if isinstance(pkg, (tuple, list)) and len(pkg) == 2:
+                name, pkg_id = pkg
+                pkgs_rendered.append(f"- {name} (`{pkg_id}`)   ✅ installed")
+            else:
+                pkgs_rendered.append(f"- `{pkg}`   ✅ installed")
+        section("Applications & Packages (Winget)", pkgs_rendered)
+        section("Windows preferences", [f"- `{k}` `{v_name}` = {val} _({vt})_" for k, v_name, vt, val in state.get("windows_prefs", [])])
+    else:
+        comm = sorted(c for c in state.get("casks", []) if c in _COMMUNICATION)
+        browsers = sorted(c for c in state.get("casks", []) if c in _BROWSERS)
+        other_casks = sorted(c for c in state.get("casks", []) if c not in _COMMUNICATION | _BROWSERS)
+        brew_apps_flat = {c.replace("-", "").lower() for c in state.get("casks", [])}
+        non_brew_apps = [
+            a for a in state.get("apps", [])
+            if a.replace(" ", "").replace("-", "").lower().removesuffix(".us") not in brew_apps_flat
+        ]
+        section("Communication", [_cask_line(c) for c in comm])
+        section("Browsers", [_cask_line(c) for c in browsers])
+        section("Other GUI apps (Homebrew casks)", [_cask_line(c) for c in other_casks])
+        section("Apps not from Homebrew", [f"- {a}   ✅ installed" for a in sorted(non_brew_apps)])
+        section("Dev tools (Homebrew formulae)", [f"- `{f}`   ✅ installed" for f in state.get("formulae", [])])
+        section("macOS preferences", [f"- `{d}` `{k}` = {v}  _({t})_" for d, k, t, v in state.get("macos_prefs", [])])
 
-    section("Applications & Packages (Winget)", pkgs_rendered)
-    section(
-        "Runtimes",
-        [f"- {label}: {version}   ✅ installed" for label, version in state.get("runtimes", {}).items()],
-    )
-    section(
-        "Global npm packages",
-        [f"- `{p}`   ✅ installed" for p in state.get("npm_globals", [])],
-    )
-    section(
-        "Windows preferences",
-        [f"- `{k}` `{v_name}` = {val} _({vt})_" for k, v_name, vt, val in state.get("windows_prefs", [])],
-    )
-    section(
-        "Git identity",
-        [f"- user.{field} = {value}" for field, value in state.get("git_identity", {}).items()],
-    )
-    section(
-        "Shell",
-        [
-            f"- shell: {state['shell']['shell']}",
-            f"- profile: {'exists ✅' if state['shell']['profile_exists'] else '⬜ not created yet'}",
-        ],
-    )
+    section("Runtimes", [f"- {label}: {version}   ✅ installed" for label, version in state.get("runtimes", {}).items()])
+    section("Global npm packages", [f"- `{p}`   ✅ installed" for p in state.get("npm_globals", [])])
+    section("Git identity", [f"- user.{field} = {value}" for field, value in state.get("git_identity", {}).items()])
+    
+    if state.get("os") == "windows":
+        section("Shell", [f"- shell: PowerShell", f"- profile: {'exists ✅' if state['shell']['profile_exists'] else '⬜ not created yet'}"])
+    else:
+        section("Shell", [f"- shell: {state['shell']['shell']}", f"- oh-my-zsh: {'yes' if state['shell']['oh_my_zsh'] else 'no'}"])
+
     gh = state.get("github", {})
     section(
         "Developer accounts",
@@ -296,18 +338,16 @@ def render_profile(state: dict) -> str:
     )
 
     out.append("## Changelog")
-    out.append(
-        f"- {_stamp()}  initial scan — captured Windows system profile"
-    )
+    out.append(f"- {_stamp()}  initial scan — captured {os_label} system profile")
     out.append("")
     return "\n".join(out)
 
 
 def _minimal_profile() -> str:
     return (
-        f"# Setup — Windows Machine Profile   (generated by SetUp Agent · last updated {_stamp()})\n\n"
+        f"# Setup — Machine Profile   (generated by SetUp Agent · last updated {_stamp()})\n\n"
         "> Living file — updated automatically as the agent installs and changes things.\n"
-        "> Run `setup-agent scan` to fill it in from the current Windows PC.\n\n"
+        "> Run `setup-agent scan` to fill it in from the current machine.\n\n"
         "## Changelog\n"
     )
 
@@ -345,8 +385,6 @@ def profile_summary(path: Path | None = None) -> str | None:
     parts = ", ".join(f"{k} ({v})" for k, v in counts.items() if v)
     return f"machine profile has: {parts}. Call read_profile for the full item list."
 
-
-# ------------------------------------------------------------ write-back ----
 
 def record_change(section: str, item: str, note: str) -> str:
     with _state_locked():

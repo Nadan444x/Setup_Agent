@@ -1,9 +1,9 @@
 r"""The safety layer: every command the LLM wants to run passes through here.
 
 Order of checks for a mutating command:
-  1. catastrophic guard      -> hard refusal (rmdir C:\, Format-Volume, diskpart, reg delete HKLM…); never runs
+  1. catastrophic guard      -> hard refusal (rm -rf /, rmdir C:\, Format-Volume...); never runs
   2. dry-run                 -> print what WOULD run, return simulated ok, execute nothing
-  3. elevated guard          -> runas / admin / internet scripts: ⚠️ warn + mandatory y/N
+  3. elevated guard          -> sudo / runas / admin / internet scripts: ⚠️ warn + mandatory y/N
   4. confirmation            -> routine commands: show + wait for y/N (skippable with --yes)
   5. execution               -> subprocess with a timeout, output captured for the LLM
 """
@@ -15,12 +15,13 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 
+from rich.live import Live
 from rich.prompt import Confirm
 from rich.table import Table
-from rich.live import Live
 
 from .console import command_preview, console, warn
 
@@ -48,30 +49,52 @@ def get_policy() -> Policy:
 
 # ------------------------------------------------------------- blocklist ----
 
+_RM_MAC = r"\brm\b(?:\s+-{1,2}[\w-]+)*\s+-{0,2}\w*[rRfF]"
+_PROTECTED_MAC = r"(/(\s|$)|/\*|~(\s|$)|\$HOME(\s|$)|(?:~|\$HOME)/|/(System|Applications|Library|Users|usr|bin|sbin|etc|var|opt|private)(/|\s|$))"
+
 _PROTECTED_WIN = r"(C:\\|C:\/|C:\\Windows|C:\\Program Files|\$HOME|%USERPROFILE%)"
 
-_CATASTROPHIC: list[tuple[re.Pattern, str]] = [
+_CATASTROPHIC_UNIX: list[tuple[re.Pattern, str]] = [
+    (re.compile(rf"{_RM_MAC}[\w-]*\s+.*{_PROTECTED_MAC}"), "recursively deletes / , home, or system path"),
+    (re.compile(r"\bfind\b.*\s-delete\b"), "mass-deletes files via find -delete"),
+    (re.compile(r"\bmkfs\b|\bnewfs\b"), "formats a filesystem"),
+    (re.compile(r"\bdd\b.*\bof=/dev/"), "raw-writes to a device"),
+    (re.compile(r"\bdiskutil\s+(erase|partition|reformat)"), "erases or repartitions a disk"),
+    (re.compile(r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;"), "fork bomb"),
+    (re.compile(r"\b(shutdown|reboot|halt)\b"), "shuts down or reboots"),
+]
+
+_CATASTROPHIC_WIN: list[tuple[re.Pattern, str]] = [
     (re.compile(rf"\b(Remove-Item|rmdir|rd|del)\b.*(-Recurse|-r|-s|-Force|-f).*{_PROTECTED_WIN}", re.I), "recursively deletes a protected system or root path"),
     (re.compile(r"\bFormat-(Volume|Disk)\b|\bClear-Disk\b", re.I), "formats or clears a disk volume"),
     (re.compile(r"\bdiskpart\b", re.I), "executes diskpart partition utility"),
     (re.compile(r"\breg\s+delete\s+hklm\\(system|software)\b", re.I), "deletes critical HKLM registry keys"),
     (re.compile(r"\b(Stop-Computer|Restart-Computer|shutdown\s+/[sf])\b", re.I), "shuts down or reboots the computer"),
-    (re.compile(r"\bbcdedit\b|\bwbadmin\s+delete\b", re.I), "modifies boot configuration or deletes backups"),
 ]
 
-_ELEVATED: list[tuple[re.Pattern, str]] = [
+_ELEVATED_UNIX: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"(^|[\s;&|(])sudo\b"), "it needs administrator rights (sudo)"),
+    (re.compile(r"\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b"), "it runs a script downloaded from internet"),
+]
+
+_ELEVATED_WIN: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(runas|Start-Process.*-Verb\s+RunAs)\b", re.I), "it requires administrator privileges"),
-    (re.compile(r"\bSet-ExecutionPolicy\b", re.I), "it changes the PowerShell execution policy"),
-    (re.compile(r"\b(iwr|Invoke-WebRequest|curl|wget)\b.*\|\s*(iex|Invoke-Expression)\b", re.I), "it executes a script directly from the internet"),
+    (re.compile(r"\bSet-ExecutionPolicy\b", re.I), "it changes PowerShell execution policy"),
+    (re.compile(r"\b(iwr|Invoke-WebRequest|curl|wget)\b.*\|\s*(iex|Invoke-Expression)\b", re.I), "it executes a script directly from internet"),
 ]
 
 ALLOWLIST_PREFIXES: tuple[str, ...] = (
+    "brew ",
     "winget ",
     "git ",
+    "defaults write ",
+    "defaults read",
     "Set-ItemProperty ",
     "reg add ",
     "reg query ",
     "mkdir ",
+    "ln -s",
+    "open ",
     "ollama ",
     "npm install -g",
     "pipx install",
@@ -79,12 +102,13 @@ ALLOWLIST_PREFIXES: tuple[str, ...] = (
     "powershell ",
 )
 
-_SHELL_METACHARS = re.compile(r"[;&|`\n]")
+_SHELL_METACHARS = re.compile(r"[;&|`\n]|\$\(|>|<")
 
 
 def refusal_or_none(command: str) -> str | None:
     stripped = command.strip()
-    for pattern, why in _CATASTROPHIC:
+    rules = _CATASTROPHIC_WIN if sys.platform == "win32" else _CATASTROPHIC_UNIX
+    for pattern, why in rules:
         if pattern.search(stripped):
             return f"REFUSED: this command is blocked because it {why}. Choose a safer approach."
     return None
@@ -92,7 +116,8 @@ def refusal_or_none(command: str) -> str | None:
 
 def elevated_reason(command: str) -> str | None:
     stripped = command.strip()
-    for pattern, why in _ELEVATED:
+    rules = _ELEVATED_WIN if sys.platform == "win32" else _ELEVATED_UNIX
+    for pattern, why in rules:
         if pattern.search(stripped):
             return why
     return None
@@ -105,10 +130,15 @@ def is_allowlisted(command: str) -> bool:
     return stripped.lower().startswith(ALLOWLIST_PREFIXES)
 
 
-# ------------------------------------------------------------- execution ----
-
 def _env_with_brew() -> dict:
     env = os.environ.copy()
+    if sys.platform == "darwin":
+        path = env.get("PATH", "")
+        for extra in ("/opt/homebrew/bin", "/usr/local/bin"):
+            if extra not in path.split(":"):
+                path = f"{path}:{extra}" if path else extra
+        env["PATH"] = path
+        env.setdefault("HOMEBREW_NO_AUTO_UPDATE", "1")
     return env
 
 
@@ -134,10 +164,7 @@ def _screen(display: str, purpose: str) -> str | None:
     if _policy.dry_run:
         console.print("[bold yellow][dry-run][/bold yellow] would run:")
         command_preview(display)
-        return (
-            f"DRY-RUN: command was NOT executed: `{display}`. "
-            "Assume it would have succeeded and continue planning."
-        )
+        return f"DRY-RUN: command was NOT executed: `{display}`. Assume success."
 
     elevated = elevated_reason(display)
     if elevated:
@@ -257,7 +284,7 @@ def guarded_batch(jobs: list[dict], purpose: str, concurrency: int = 3, timeout:
         with lock:
             status[label] = "installing"
         try:
-            proc = subprocess.run(job["argv"], shell=False, capture_output=True, text=True, timeout=timeout)
+            proc = subprocess.run(job["argv"], shell=False, capture_output=True, text=True, timeout=timeout, env=_env_with_brew())
             code, out, err = proc.returncode, proc.stdout, proc.stderr
         except Exception as exc:
             code, out, err = 1, "", str(exc)

@@ -1,7 +1,7 @@
 """setup-agent CLI — Typer commands wiring everything together.
 
-  scan    inspect this Windows PC -> write/refresh Setup.md
-  doctor  preflight: winget? ollama? model? Setup.md?
+  scan    inspect this machine -> write/refresh Setup.md
+  doctor  preflight: brew/winget? ollama? model? Setup.md?
   setup   read Setup.md -> install gaps + apply config/prefs
   run     one-shot natural-language goal
   chat    interactive REPL
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from typing import Annotated, Optional
 
 import typer
@@ -21,7 +22,7 @@ from .console import console, error, info, rule, status_table, success
 
 app = typer.Typer(
     name="setup-agent",
-    help="Terminal agent that provisions a fresh Windows PC, driven by a local LLM (Ollama) and Winget.",
+    help="Terminal agent that provisions a fresh Mac or Windows PC, driven by a local LLM (Ollama).",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -52,14 +53,14 @@ def _configure(profile: Optional[str], dry_run: bool = False, confirm: bool = Fa
 
 @app.command()
 def scan(profile: ProfileOpt = None) -> None:
-    """Inspect this Windows PC and generate/refresh the living Setup.md (read-only scan)."""
+    """Inspect this machine and generate/refresh the living Setup.md (read-only scan)."""
     _configure(profile)
     from .state import profile_path, write_initial_profile
 
     target = profile_path()
     if target.exists():
         info(f"refreshing existing profile at {target}")
-    with console.status("scanning the machine (winget, packages, runtimes, registry prefs)…"):
+    with console.status("scanning the machine…"):
         written = write_initial_profile(target)
     success(f"profile written: {written}")
     info("open it, adjust anything you like, then try:  setup-agent setup --dry-run")
@@ -72,16 +73,17 @@ def doctor(model: ModelOpt = DEFAULT_MODEL, profile: ProfileOpt = None) -> None:
     from . import llm
     from .state import profile_path
 
-    winget = shutil.which("winget")
+    pkg_mgr = "Winget" if sys.platform == "win32" else "Homebrew"
+    pkg_bin = shutil.which("winget") if sys.platform == "win32" else shutil.which("brew")
     ollama_bin = shutil.which("ollama")
     server = llm.server_up() if ollama_bin else False
     model_ok = llm.has_model(model) if server else False
     prof = profile_path()
 
     rows = [
-        ("Winget", bool(winget), winget or "Winget Package Manager"),
-        ("Ollama binary", bool(ollama_bin), ollama_bin or "winget install Ollama.Ollama"),
-        ("Ollama server", server, "ok" if server else "ollama app (or ollama serve)"),
+        (pkg_mgr, bool(pkg_bin), pkg_bin or f"{pkg_mgr} package manager"),
+        ("Ollama binary", bool(ollama_bin), ollama_bin or "install ollama"),
+        ("Ollama server", server, "ok" if server else "ollama serve"),
         (f"model {model}", model_ok, "pulled" if model_ok else f"ollama pull {model}"),
         ("Setup.md profile", prof.exists(), str(prof) if prof.exists() else "setup-agent scan"),
     ]
@@ -89,7 +91,8 @@ def doctor(model: ModelOpt = DEFAULT_MODEL, profile: ProfileOpt = None) -> None:
     if all(ok for _, ok, _ in rows):
         success("everything ready — try:  setup-agent run \"install jq\" --dry-run")
     else:
-        error("fix the ✗ rows above (bootstrap.ps1 handles all of them on a fresh Windows PC)")
+        bootstrap_cmd = "bootstrap.ps1" if sys.platform == "win32" else "bootstrap.sh"
+        error(f"fix the ✗ rows above ({bootstrap_cmd} handles all of them on a fresh machine)")
 
 
 @app.command()
@@ -110,10 +113,10 @@ def setup(
         raise typer.Exit(1)
 
     run_goal(
-        "Provision this Windows machine to match the Setup.md profile. FIRST call read_profile to "
+        "Provision this machine to match the Setup.md profile. FIRST call read_profile to "
         "see the full list. Then work section by section: (1) install every listed app or "
         "tool that is missing or marked ⬜ — check each first; (2) apply the git identity if "
-        "not set; (3) apply the PowerShell profile lines; (4) apply the Windows preferences. Skip everything "
+        "not set; (3) apply the shell lines; (4) apply the preferences. Skip everything "
         "already ✅/present. Finish with a summary of installed / already present / skipped / failed.",
         model=model,
     )
