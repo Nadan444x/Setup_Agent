@@ -132,7 +132,6 @@ _RUNTIME_PROBES = [
 ]
 
 _IGNORE_PATTERNS = [
-    "MSIX\\", "ARP\\Machine\\", "ARP\\User\\",
     "Microsoft.VCRedist", "Microsoft.VCLibs", "Microsoft.UI.Xaml",
     "Microsoft.NET", "Microsoft.Net", "Microsoft.DirectX", "Microsoft.DotNet",
     "Microsoft.Windows.AppRuntime", "Microsoft.WindowsAppRuntime", "Microsoft.DesktopAppInstaller",
@@ -145,7 +144,7 @@ _IGNORE_PATTERNS = [
     "Microsoft.YourPhone", "Microsoft.ZuneMusic", "Microsoft.ZuneVideo",
     "Microsoft.WindowsStore", "Microsoft.WindowsMaps", "Microsoft.WindowsCamera",
     "Microsoft.WindowsAlarms", "Microsoft.WindowsCalculator", "Microsoft.WindowsSoundRecorder",
-    "Nvidia.", "PhysX", "EPSON", "Redistributable", "Runtime Package", "System Software",
+    "Nvidia.", "PhysX", "Redistributable", "Runtime Package", "System Software",
     "Desktop Runtime", "SDK", "Driver", "Framework Package", "Native Framework",
 ]
 
@@ -192,10 +191,58 @@ def _parse_winget_list(out: str) -> list[tuple[str, str]]:
         if any(pat.lower() in combined for pat in _IGNORE_PATTERNS):
             continue
 
-        if pkg_id not in seen:
-            seen.add(pkg_id)
-            results.append((name, pkg_id))
+        # Clean ARP / MSIX prefix from pkg_id for display
+        clean_id = pkg_id
+        for prefix in ("ARP\\Machine\\X86\\", "ARP\\Machine\\X64\\", "ARP\\User\\X86\\", "ARP\\User\\X64\\", "MSIX\\"):
+            if clean_id.upper().startswith(prefix.upper()):
+                clean_id = clean_id[len(prefix):]
+                break
+
+        if clean_id not in seen:
+            seen.add(clean_id)
+            results.append((name, clean_id))
     return results
+
+
+
+def _scan_start_menu_apps() -> list[str]:
+    ps_cmd = (
+        "Get-ChildItem -Path '$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs', "
+        "'$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs' -Recurse -Filter '*.lnk' | "
+        "Select-Object -ExpandProperty BaseName"
+    )
+    code, out, _ = run_readonly(f"powershell -NoProfile -Command \"{ps_cmd}\"", timeout=15)
+    if code != 0 or not out.strip():
+        return []
+
+    ignore_shortcuts = {
+        "administrative tools", "command prompt", "control panel", "run", "task manager",
+        "file explorer", "snoretoast", "uninstall", "uninstall node.js", "vlc media player - reset preferences and cache files",
+        "vlc media player skinned", "videolan website", "documentation", "release notes",
+        "user guide", "console rar manual", "what is new in the latest version", "winrar help",
+        "character map", "component services", "computer management", "disk cleanup", "event viewer",
+        "iscsi initiator", "memory diagnostics tool", "odbc data sources (32-bit)", "odbc data sources (64-bit)",
+        "performance monitor", "recoverydrive", "registry editor", "resource monitor", "services",
+        "system configuration", "system information", "task scheduler", "windows defender firewall with advanced security",
+        "steps recorder", "windows media player legacy", "remote desktop connection", "dfrgui",
+        "windows powershell", "windows powershell (x86)", "windows powershell ise", "windows powershell ise (x86)",
+        "developer command prompt for vs 2022", "developer powershell for vs 2022", "debuggable package manager",
+        "idle (python 3.12 64-bit)", "python 3.12 (64-bit)", "python 3.12 manuals (64-bit)", "python 3.12 module docs (64-bit)",
+        "install additional tools for node.js", "node.js command prompt"
+    }
+
+    apps = []
+    seen = set()
+    for line in out.splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        if name.lower() in ignore_shortcuts:
+            continue
+        if name not in seen:
+            seen.add(name)
+            apps.append(name)
+    return apps
 
 
 def scan_system() -> dict:
@@ -207,6 +254,7 @@ def scan_system() -> dict:
         code, out, _ = run_readonly("winget list --accept-source-agreements", timeout=45)
         winget_pkgs = _parse_winget_list(out) if code == 0 else []
         state["winget_packages"] = winget_pkgs[:100]
+        state["start_menu_apps"] = _scan_start_menu_apps()
         prefs: list[tuple[str, str, str, str]] = []
         for key_path, val_name, v_type in _WIN_PREF_KEYS:
             ps_cmd = f"(Get-ItemProperty -Path '{key_path}' -Name '{val_name}' -ErrorAction SilentlyContinue).{val_name}"
@@ -217,6 +265,7 @@ def scan_system() -> dict:
         ps_profile = Path.home() / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
         state["shell"] = {"shell": "PowerShell", "profile_exists": ps_profile.exists()}
     else:
+
         state["formulae"] = _lines("brew leaves")
         state["casks"] = _lines("brew list --cask")
         apps: set[str] = set()
@@ -301,7 +350,17 @@ def render_profile(state: dict) -> str:
             else:
                 pkgs_rendered.append(f"- `{pkg}`   ✅ installed")
         section("Applications & Packages (Winget)", pkgs_rendered)
+        
+        winget_names_flat = {p[0].lower().replace(" ", "") for p in state.get("winget_packages", []) if isinstance(p, (tuple, list))}
+        extra_start_apps = [
+            a for a in state.get("start_menu_apps", [])
+            if a.lower().replace(" ", "") not in winget_names_flat
+        ]
+        if extra_start_apps:
+            section("Apps not from Winget (Start Menu)", [f"- {a}   ✅ installed" for a in sorted(extra_start_apps)])
+
         section("Windows preferences", [f"- `{k}` `{v_name}` = {val} _({vt})_" for k, v_name, vt, val in state.get("windows_prefs", [])])
+
     else:
         comm = sorted(c for c in state.get("casks", []) if c in _COMMUNICATION)
         browsers = sorted(c for c in state.get("casks", []) if c in _BROWSERS)
